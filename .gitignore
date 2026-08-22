@@ -1,0 +1,4 @@
+*.ipynb
+*test.py
+*.venv
+*.txt
