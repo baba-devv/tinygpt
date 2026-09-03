@@ -18,7 +18,6 @@ def render(data, tokenizer):
     max_seq = 0
 
     for opt in options:
-        # import code; code.interact(local=locals())
         opt_encoded = tokenizer.encode(" " + opt) # we need a space between question and answer 
         if len(opt_encoded) > max_seq:
             max_seq = len(opt_encoded)
@@ -86,15 +85,11 @@ def eval_hellaswag(model, tokenizer, device, ddp, ddp_rank, ddp_world_size):
         label_correct.append(int(opt_pred.item()==label))
         label_correct_avg.append(int(opt_pred_avg.item()==label))
 
-        # import code; code.interact(local=locals())
-
         if i % 500 == 0 and i != 0 and ddp_rank == 0:
             print(f"{i} texts evaluated")
 
     # print(f"label correct - {label_correct}")
     # print(f"label correct avg - {label_correct_avg}")
-
-    model.train()
 
     stats = torch.tensor([len(label_correct), sum(label_correct), sum(label_correct_avg)], dtype=torch.long, device=device)
 
@@ -107,6 +102,8 @@ def eval_hellaswag(model, tokenizer, device, ddp, ddp_rank, ddp_world_size):
         accuracy_avg = correct_avg / total
 
         print(f"accuracy of hellaswag eval over tokens: {accuracy*100} and on per token: {accuracy_avg*100}")
+
+    return accuracy, accuracy_avg
 
 
 # test script
@@ -136,7 +133,7 @@ def main():
     model = GPT(GPTConfig(block_size=block_size, vocab_size=50304))
     model = model.to(device)
 
-    eval_hellaswag(model, enc, device, ddp=False, ddp_rank=ddp_rank, ddp_world_size=ddp_world_size) # evaluate on our initialized model
+    accuracy, accuracy_avg = eval_hellaswag(model, enc, device, ddp=False, ddp_rank=ddp_rank, ddp_world_size=ddp_world_size) # evaluate on our initialized model
     print(f"Hellaswag evaluation completed for gpt2 self")
 
 if __name__ == "__main__":
