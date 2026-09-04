@@ -2,7 +2,7 @@ import torch
 from torch.nn import functional as F
 import torch.distributed as dist
 
-
+from train_gpt2 import block_size
 from datasets import load_dataset
 
 # ds = load_dataset("Rowan/hellaswag", split="train[:4]") 
@@ -39,8 +39,6 @@ def render(data, tokenizer):
         targets.append(mask_curr)
 
     return tokens, targets, label
-        
-block_size = 1024 # @TODO: assume this will come from some global config which has set the block size for the model - again not needed when RoPE is implemented
 
 def eval_hellaswag(model, tokenizer, device, ddp, ddp_rank, ddp_world_size):
     #@NOTE: the model to be passed here should be raw in case ddp is not true   
