@@ -32,7 +32,7 @@ n_embd: int = 768  # embedding dimension
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1 # go to 10% of the max_lr according to GPT-3
-warmup_steps = 1
+warmup_steps = 715
 max_steps = 19073
 
 learning_rate = 6e-4
@@ -40,8 +40,8 @@ weight_decay = 0.1 # 10%
 
 val_step = 100 # validation loss every 100th step
 val_loss_steps = 20
-eval_step = 250 # hellaswag evaluation every 250th step
-sampling_step = 200 # sample from the model every 200th step
+eval_step = 100 # hellaswag evaluation every 250th step
+sampling_step = 1000 # sample from the model every 200th step
 
 log_dir = "log"
 os.makedirs(log_dir, exist_ok=True)

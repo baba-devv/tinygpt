@@ -44,8 +44,8 @@ def eval_hellaswag(model, tokenizer, device, ddp, ddp_rank, ddp_world_size, bloc
     label_correct = []  # this will hold either 0 or 1 based on whether the opt_pred == label
     label_correct_avg = []  # this will hold either 0 or 1 based on whether the opt_pred_avg == label
 
-    if ddp_rank == 0:
-        print(f"Total sets - {len(ds)//ddp_world_size}")
+    # if ddp_rank == 0:
+    #     print(f"Total sets - {len(ds)//ddp_world_size}")
 
     model.eval()
 
@@ -81,8 +81,8 @@ def eval_hellaswag(model, tokenizer, device, ddp, ddp_rank, ddp_world_size, bloc
         label_correct.append(int(opt_pred.item()==label))
         label_correct_avg.append(int(opt_pred_avg.item()==label))
 
-        if i % 500 == 0 and i != 0 and ddp_rank == 0:
-            print(f"{i} texts evaluated")
+        # if i % 500 == 0 and i != 0 and ddp_rank == 0:
+        #     print(f"{i} texts evaluated")
 
     # print(f"label correct - {label_correct}")
     # print(f"label correct avg - {label_correct_avg}")
@@ -98,7 +98,7 @@ def eval_hellaswag(model, tokenizer, device, ddp, ddp_rank, ddp_world_size, bloc
         accuracy = correct / total
         accuracy_avg = correct_avg / total
 
-        print(f"accuracy of hellaswag eval over tokens: {accuracy*100} and on per token: {accuracy_avg*100}")
+        # print(f"accuracy of hellaswag eval over tokens: {accuracy*100} and on per token: {accuracy_avg*100}")
 
     return accuracy, accuracy_avg
 
