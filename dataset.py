@@ -2,8 +2,6 @@ import os
 import numpy as np
 import torch
 
-from train_gpt2 import master_process 
-
 
 def load_tokens(filename):
     npt = np.load(filename)
@@ -12,7 +10,7 @@ def load_tokens(filename):
 
 class DataLoaderLite:
 
-    def __init__(self, B, T, process_rank, num_processes, split):
+    def __init__(self, B, T, process_rank, num_processes, split, current_shard=None, current_pos=None):
         self.B = B
         self.T = T
         self.process_rank = process_rank
@@ -27,14 +25,14 @@ class DataLoaderLite:
         shards = [os.path.join(data_root, s) for s in shards] # get the actual relative file paths
         self.shards = shards
         assert len(shards) > 0, f"no shards found for split {split}"
-        if master_process:
+        if self.process_rank == 0:
             print(f"found {len(shards)} shards for split {split}")
 
         # state, init at shard zero
-        self.current_shard = 0
+        self.current_shard = current_shard if current_shard is not None else 0  # if loading from checkpoint
         self.tokens = load_tokens(shards[self.current_shard])
         # state
-        self.current_position = self.B * self.T * self.process_rank
+        self.current_position = current_pos if current_pos is not None else self.B * self.T * self.process_rank
 
     def reset(self):
         self.current_shard = 0

@@ -1,8 +1,6 @@
 import torch
 from torch.nn import functional as F
 import torch.distributed as dist
-
-from train_gpt2 import block_size
 from datasets import load_dataset
 
 # ds = load_dataset("Rowan/hellaswag", split="train[:4]") 
@@ -40,7 +38,7 @@ def render(data, tokenizer):
 
     return tokens, targets, label
 
-def eval_hellaswag(model, tokenizer, device, ddp, ddp_rank, ddp_world_size):
+def eval_hellaswag(model, tokenizer, device, ddp, ddp_rank, ddp_world_size, block_size):
     #@NOTE: the model to be passed here should be raw in case ddp is not true   
 
     label_correct = []  # this will hold either 0 or 1 based on whether the opt_pred == label
@@ -94,6 +92,7 @@ def eval_hellaswag(model, tokenizer, device, ddp, ddp_rank, ddp_world_size):
     if ddp: # if master process
         dist.all_reduce(stats, op=dist.ReduceOp.SUM)
 
+    accuracy = accuracy_avg = None
     if ddp_rank == 0:
         total, correct, correct_avg = stats.tolist()
         accuracy = correct / total
@@ -121,17 +120,18 @@ def main():
     enc = tiktoken.get_encoding('gpt2')
     ddp_rank = 0  # for mps check
     ddp_world_size = 1 # for mps check
+    block_size = 1024
 
     # model = GPT.from_pretrained("gpt2")
     # model = model.to(device)
-    # eval_hellaswag(model, enc, device, ddp=False, ddp_rank=ddp_rank, ddp_world_size=ddp_world_size) # evaluate on GPT-2 124M model
+    # eval_hellaswag(model, enc, device, ddp=False, ddp_rank=ddp_rank, ddp_world_size=ddp_world_size, block_size=block_size) # evaluate on GPT-2 124M model
     # print(f"Hellaswag evaluation completed for gpt2")
 
     print(f"Hellaswag evaluation on initialized tinygpt model")
     model = GPT(GPTConfig(block_size=block_size, vocab_size=50304))
     model = model.to(device)
 
-    accuracy, accuracy_avg = eval_hellaswag(model, enc, device, ddp=False, ddp_rank=ddp_rank, ddp_world_size=ddp_world_size) # evaluate on our initialized model
+    accuracy, accuracy_avg = eval_hellaswag(model, enc, device, ddp=False, ddp_rank=ddp_rank, ddp_world_size=ddp_world_size, block_size=block_size) # evaluate on our initialized model
     print(f"Hellaswag evaluation completed for gpt2 self")
 
 if __name__ == "__main__":

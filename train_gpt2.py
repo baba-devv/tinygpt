@@ -8,10 +8,14 @@ import torch.distributed as dist
 
 import os
 import time
+import json
 
 from model import GPT, GPTConfig
 from dataset import DataLoaderLite
+from checkpoint import save_checkpoint, load_checkpoint
 from hellaswag import eval_hellaswag
+
+import argparse
 
 # ----------------------------------------------------------------------------------
 # define global hyperparams
@@ -28,8 +32,8 @@ n_embd: int = 768  # embedding dimension
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1 # go to 10% of the max_lr according to GPT-3
-warmup_steps = 0
-max_steps = 1
+warmup_steps = 1
+max_steps = 19073
 
 learning_rate = 6e-4
 weight_decay = 0.1 # 10%
@@ -39,13 +43,31 @@ val_loss_steps = 20
 eval_step = 250 # hellaswag evaluation every 250th step
 sampling_step = 200 # sample from the model every 200th step
 
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True)
+
+log_file = os.path.join(log_dir, "log.json") # for logging losses etc.
+
+checkpointing = True
+checkpoint_step = 5000  # the checkpoint will be heavy, store 3-4 for the whole run
+if checkpointing:
+    checkpoint_dir = os.path.join(log_dir, "checkpoint")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+# load checkpoint path if passed
+parser = argparse.ArgumentParser(description="Training")
+parser.add_argument('--resume-from', type=str, required=False, default=None)
+args = parser.parse_args()
+
+resume_from = args.resume_from  # version of model
+if resume_from:
+    resume_from = os.path.join("checkpoint", resume_from)
+    resume_from = os.path.join(log_dir, resume_from) # point it to the correct file
+
 # updating the processing precision TF32 instead of FP32
 torch.set_float32_matmul_precision('high')
 
-# seeding
-torch.manual_seed(42)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(42)
+seed = cuda_seed = 42
 
 # load the tokenizer
 import tiktoken
@@ -88,10 +110,40 @@ if master_process:
     print(f"total desired batch size: {total_batch_size}")
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
+# seeding
+torch.manual_seed(seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(cuda_seed)
+
 # create model
 # model = GPT.from_pretrained('gpt2')
 model = GPT(GPTConfig(block_size=block_size, vocab_size=vocab_size, n_layer=n_layer, n_head=n_head, n_embd=n_embd))
 model.to(device)
+
+# optimize, betas updated according to GPT-3
+optimizer = model.configure_optimizers(weight_decay=weight_decay, learning_rate=learning_rate, device=device)
+
+# load saved model if needed
+start_step = 0
+current_train_shard = None
+current_train_pos = None
+if resume_from:
+    try:
+        ckpt = load_checkpoint(resume_from, model, optimizer, device)
+        start_step = ckpt['step']
+        torch.set_rng_state(ckpt['rng_state'])
+        if torch.cuda.is_available() and ckpt.get("cuda_rng_state") is not None:
+            torch.cuda.set_rng_state(ckpt["cuda_rng_state"])
+
+        current_train_shard, current_train_pos = ckpt['loader_pos']
+        current_train_pos = current_train_pos + (B * T * ddp_rank)  # init the correct starting pos for each gpu
+        if master_process:
+            print(f"resuming training from: {resume_from}, step: {start_step}")
+    except Exception as e:
+        print(f"Error loading the checkpoint file - {e}")
+        import sys; sys.exit(1)
+
+assert start_step < max_steps, "starting step cannot be more than the max steps"
 
 uncompiled_model = model # for processes where the shapes are changing we should use the uncompiled model
 
@@ -115,18 +167,18 @@ def get_lr(it):
     return min_lr + coeff * (max_lr - min_lr) 
 
 # init data loader
-train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train", current_shard=current_train_shard, current_pos=current_train_pos)
 val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
-
-# optimize, betas updated according to GPT-3
-optimizer = raw_model.configure_optimizers(weight_decay=weight_decay, learning_rate=learning_rate, device=device)
 
 # ---------------------------------------------------------------------------------------
 # run the training loop
 
-for step in range(max_steps):
-    t0 = time.time()
-    
+for step in range(start_step, max_steps):
+
+    val_loss_accum = None
+    accuracy = None
+    avg_accuracy = None
+
     # eval step, once in a while calculate the validation loss
     if step % val_step == 0:
         model.eval()
@@ -146,21 +198,22 @@ for step in range(max_steps):
         if ddp:
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
         if master_process:
+            val_loss_accum = val_loss_accum.item()
             print(f"\n")
-            print(f"validation loss: {val_loss_accum.item():.4f}")
+            print(f"step: {step}, validation loss: {val_loss_accum:.4f}")
             print("\n")
 
     # run Hellaswag eval
     if step % eval_step == 0:
         uncompiled_model.eval()
-        accuracy, avg_accuracy = eval_hellaswag(uncompiled_model, enc, device, ddp, ddp_rank, ddp_world_size)
+        accuracy, avg_accuracy = eval_hellaswag(uncompiled_model, enc, device, ddp, ddp_rank, ddp_world_size, block_size=block_size)
         if master_process:
-            print(f"Hellaswag Eval accuracy - {avg_accuracy}")
+            print(f"Hellaswag Eval accuracy - {avg_accuracy*100:.2f}")
 
     # once in a while, generate from model - sampling
     if step > 0 and step % sampling_step == 0:
         model.eval()
-        num_return_sequences = 4
+        num_return_sequences = 2
         max_length = 64
         tokens = enc.encode("Hello, I'm a language model")
         tokens = torch.tensor(tokens, dtype=torch.long)
@@ -192,7 +245,16 @@ for step in range(max_steps):
             decoded = enc.decode(tokens)
             print(f"rank {ddp_rank} sample {i}: {decoded}")
 
+    # save model if checkpointing is true
+    if checkpointing and (step % checkpoint_step == 0 or step == max_steps-1) and step != 0 and master_process:
+        path = os.path.join(checkpoint_dir, f"model_{step:05d}.pt")
+        cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+        save_checkpoint(path, uncompiled_model, optimizer, step, val_loss_accum, uncompiled_model.config, train_loader, cuda_rng_state=cuda_rng_state)
+        print(f"Checkpoint saved at - {path}")
+
     # training loop
+    t0 = time.time()
+
     model.train()
 
     # zero the gradients to avoid accumulation
@@ -236,8 +298,32 @@ for step in range(max_steps):
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / dt
 
+    mfu = raw_model.estimate_mfu(B * grad_accum_steps, dt)
+
     if master_process:
-        print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        loss = loss_accum.item()
+        norm = norm.item()
+
+        print(f"step {step:4d} | loss: {loss:.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f} | mfu: {mfu:.2f}")
+
+        # log losses to file
+        with open(log_file, 'a') as f:
+            value = {
+                'step': step, 
+                'lr': lr, 
+                'train': loss, 
+                'norm': norm,
+                'dt': dt,
+                'mfu': mfu
+            }
+
+            if val_loss_accum is not None:
+                value['val'] = val_loss_accum
+            if accuracy is not None and avg_accuracy is not None:
+                value['accuracy'] = accuracy
+                value['avg_accuracy'] = avg_accuracy
+
+            f.write(json.dumps(value) + "\n")
 
 if ddp:
     destroy_process_group()

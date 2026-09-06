@@ -219,7 +219,7 @@ class GPT(nn.Module):
 
         return model
     
-    def estimated_mfu(self, fwdbwd_per_iter, dt):
+    def estimate_mfu(self, fwdbwd_per_iter, dt):
         """ estimate model flops utilization (MFU) in units of GPU (A100) bfloat16 peak FLOPS """
         # estimate the number of flops per iteration per gpu
         # see PaLM paper Appendix B of https://arxiv.org/pdf/2204.02311
