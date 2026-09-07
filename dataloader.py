@@ -46,10 +46,6 @@ def main():
         progress_bar = None
 
         for tokens in pool.imap(tokenize, fw, chunksize=16):
-
-            if shard_index > 2:
-                break
-
             # is there enough space in the current shard for the new tokens ?
             if token_count + len(tokens) < shard_size:
                 # simply append tokens to current shard

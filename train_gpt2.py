@@ -74,7 +74,7 @@ import tiktoken
 enc = tiktoken.get_encoding('gpt2')
 
 # ----------------------------------------------------------------------------------
-
+# run: torchrun --standalone --nproc_per_node=4 train_gpt2.py
 # setup DDP (distributed data parallel)
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run
 
