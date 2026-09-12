@@ -24,7 +24,7 @@ use_compile = True
 
 total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
 B = 64 # micro batch size
-block_size = T = 1024 # sequence length
+block_size_train = T_train = 1024 # sequence length
 vocab_size = 50304
 n_layer: int = 12 # number of layers
 n_head: int = 12 # number of heads
@@ -40,7 +40,11 @@ weight_decay = 0.1 # 10%
 
 val_step = 100 # validation loss every 100th step
 val_loss_steps = 20
-eval_step = 100 # hellaswag evaluation every 250th step
+val_block_sizes = [512, 1024, 2048, 4096]
+
+assert all([((B*T_train) % block_size == 0) for block_size in val_block_sizes]), f'{val_block_sizes} are not compatible with train - batch_size {B} and seq length {T_train}' 
+
+eval_step = 250 # hellaswag evaluation every 250th step
 sampling_step = 1000 # sample from the model every 200th step
 
 log_dir = "log"
@@ -103,8 +107,8 @@ else:
     print(f"Using device: {device}")
 
 
-assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
-grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+assert total_batch_size % (B * T_train * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T_train * ddp_world_size"
+grad_accum_steps = total_batch_size // (B * T_train * ddp_world_size)
 
 if master_process:
     print(f"total desired batch size: {total_batch_size}")
@@ -116,8 +120,8 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(cuda_seed)
 
 # create model
-# model = GPT.from_pretrained('gpt2')
-model = GPT(GPTConfig(block_size=block_size, vocab_size=vocab_size, n_layer=n_layer, n_head=n_head, n_embd=n_embd))
+# model = GPT(GPTConfig(block_size=block_size, vocab_size=vocab_size, n_layer=n_layer, n_head=n_head, n_embd=n_embd))
+model = GPT(GPTConfig(vocab_size=vocab_size, n_layer=n_layer, n_head=n_head, n_embd=n_embd))
 model.to(device)
 
 # optimize, betas updated according to GPT-3
@@ -136,7 +140,7 @@ if resume_from:
             torch.cuda.set_rng_state(ckpt["cuda_rng_state"])
 
         current_train_shard, current_train_pos = ckpt['loader_pos']
-        current_train_pos = current_train_pos + (B * T * ddp_rank)  # init the correct starting pos for each gpu
+        current_train_pos = current_train_pos + (B * T_train * ddp_rank)  # init the correct starting pos for each gpu
         if master_process:
             print(f"resuming training from: {resume_from}, step: {start_step}")
     except Exception as e:
@@ -167,46 +171,60 @@ def get_lr(it):
     return min_lr + coeff * (max_lr - min_lr) 
 
 # init data loader
-train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train", current_shard=current_train_shard, current_pos=current_train_pos)
-val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
+train_loader = DataLoaderLite(B=B, T=T_train, process_rank=ddp_rank, num_processes=ddp_world_size, split="train", current_shard=current_train_shard, current_pos=current_train_pos)
+val_loader = DataLoaderLite(B=B, T=None, process_rank=ddp_rank, num_processes=ddp_world_size, split="val") # T has to be None for val, in case it is passed 
+
+
+def val_loss(step, block_size=T_train):
+
+    global uncompiled_model, val_step, val_loader, device, val_loss_steps, ddp, master_process, T_train, B
+
+    uncompiled_model.eval() # validation should not force recompile the model on each T update
+    val_loader.reset(split="val") # call reset once every block_size so that common data is evaluated
+
+    batch_size = (B * T_train) // block_size
+
+    with torch.no_grad():
+        val_loss_accum = 0.0
+
+        for _ in range(val_loss_steps):
+            # check the loss on validation set
+            x, y = val_loader.next_batch(B=batch_size, T=block_size)
+            x, y = x.to(device), y.to(device)
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):  # do the forward pass in a lower precision
+                # forward pass  # calculate logits and loss
+                logits, loss = uncompiled_model(x, y)   #@TODO: this loss is fine but a reduction=False also is needed so that
+                                                        # we can derive the common 512 token loss over all the seq. lengths 
+            loss = loss / val_loss_steps
+            val_loss_accum += loss.detach()
+    if ddp:
+        dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+    if master_process:
+        val_loss_accum = val_loss_accum.item()
+        print(f"\n")
+        print(f"step: {step}, block_size: {block_size}, validation loss: {val_loss_accum:.4f}")
+        print("\n")
+
+    return val_loss_accum
+
 
 # ---------------------------------------------------------------------------------------
 # run the training loop
 
 for step in range(start_step, max_steps):
 
-    val_loss_accum = None
     accuracy = None
     avg_accuracy = None
+    val_loss_accum = None
 
     # eval step, once in a while calculate the validation loss
     if step % val_step == 0:
-        model.eval()
-        val_loader.reset()
-        with torch.no_grad():
-            val_loss_accum = 0.0
-
-            for _ in range(val_loss_steps):
-                # check the loss on validation set
-                x, y = val_loader.next_batch()
-                x, y = x.to(device), y.to(device)
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):  # do the forward pass in a lower precision
-                    # forward pass  # calculate logits and loss
-                    logits, loss = model(x, y)
-                loss = loss / val_loss_steps
-                val_loss_accum += loss.detach()
-        if ddp:
-            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
-        if master_process:
-            val_loss_accum = val_loss_accum.item()
-            print(f"\n")
-            print(f"step: {step}, validation loss: {val_loss_accum:.4f}")
-            print("\n")
-
+        val_loss_accum = {f'val_loss_{block_size}' : val_loss(step, block_size) for block_size in val_block_sizes} # validation loss for different block sizes
+   
     # run Hellaswag eval
     if step % eval_step == 0:
         uncompiled_model.eval()
-        accuracy, avg_accuracy = eval_hellaswag(uncompiled_model, enc, device, ddp, ddp_rank, ddp_world_size, block_size=block_size)
+        accuracy, avg_accuracy = eval_hellaswag(uncompiled_model, enc, device, ddp, ddp_rank, ddp_world_size, block_size=block_size_train)
         if master_process:
             print(f"Hellaswag Eval accuracy - {avg_accuracy*100:.2f}")
 
@@ -298,7 +316,7 @@ for step in range(start_step, max_steps):
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / dt
 
-    mfu = raw_model.estimate_mfu(B * grad_accum_steps, dt)
+    mfu = raw_model.estimate_mfu(B * grad_accum_steps, train_loader.T, dt)
 
     if master_process:
         loss = loss_accum.item()

@@ -18,7 +18,42 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
         self.n_head = config.n_head
         self.n_embd = config.n_embd
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size))
+        self.block_size_max = config.block_size_max
+
+        cos, sin = self._rope_buffer()
+
+        # self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)) # not needed if using flash-attention
+        self.register_buffer("rope_cos", cos.view(1, 1, self.block_size_max, self.n_embd // self.n_head), persistent=False) # don't save to checkpoint
+        self.register_buffer("rope_sin", sin.view(1, 1, self.block_size_max, self.n_embd // self.n_head), persistent=False) # don't save to checkpoint
+
+    def _rope_buffer(self):
+        hs = self.n_embd // self.n_head # head size
+        freq = 1e4**(-torch.arange(0, hs, 2) / hs) # (hs/2,)
+        
+        angles = torch.arange(self.block_size_max).view(self.block_size_max, 1) * freq # (T, hs/2) - this is outer product
+
+        cos, sin = angles.cos(), angles.sin() # both shape (T, hs/2)
+
+        cos = torch.repeat_interleave(cos, 2, dim=1) # (T, hs)
+        sin = torch.repeat_interleave(sin, 2, dim=1) # (T, hs)
+
+        return cos, sin
+    
+    def _rotate(self, inp):
+        B, nh, T, hs = inp.size()
+
+        cos, sin = self.rope_cos, self.rope_sin # (1, 1, T_max, hs)
+        cos, sin = cos[:, :, :T, :], sin[:, :, :T, :]  # trim the buffer to block size - (1, 1, T, hs)
+
+        inp_cos, inp_sin = inp*cos, inp*sin
+
+        # swap sin
+        inp_sin_swap = inp_sin.clone()
+        inp_sin_swap[..., 0::2] = -inp_sin[..., 1::2] # Put odd columns into even slots
+        inp_sin_swap[..., 1::2] = inp_sin[..., 0::2] # Put even columns into odd slots
+
+        inp_rotate = inp_cos + inp_sin_swap # (T, hs)
+        return inp_rotate
 
     def forward(self, x):
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
@@ -29,6 +64,10 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+
+        # rotate q, k
+        q = self._rotate(q)  # (B, nh, T, hs)
+        k = self._rotate(k)  # (B, nh, T, hs)
 
         # Normal attention (materialises the large (T,T) matrix for all the queries and keys)  == this means memory gets allocated for (T, T) in the HBM
         # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))  # divide by the sqrt of the head size = B, nh, T, T
@@ -76,11 +115,12 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
-    block_size: int = 1024  # max sequence length
+    # block_size: int = 1024  # max sequence length
     vocab_size: int = 50257  # number of tokens: 50,000 BPE merges + 256 byte tokens + 1 <|endoftext|>
     n_layer: int = 12 # number of layers
     n_head: int = 12 # number of heads
     n_embd: int = 768  # embedding dimension
+    block_size_max: int = int(1e4) # max block size supported
 
 
 class GPT(nn.Module):
@@ -88,12 +128,12 @@ class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.vocab_size is not None
-        assert config.block_size is not None
+        # assert config.block_size is not None
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            # wpe = nn.Embedding(config.block_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd),
         ))
@@ -113,16 +153,11 @@ class GPT(nn.Module):
         # report number of parameters
         print(f"number of parameters: {(self.get_num_params()/1e6):.2f}M")
 
-    def get_num_params(self, non_embedding=True):
+    def get_num_params(self):
         """
         Return the number of parameters in the model.
-        For non-embedding count (default), the position embeddings get subtracted
-        The token embeddings would too, except due to the parameter sharing these
-        params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
     def _init_weights(self, module):
@@ -137,13 +172,14 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         # idx is of shape (B, T)
         B, T = idx.size()
-        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is {self.config.block_size}"
+        assert T <= self.config.block_size_max, f"Cannot forward sequence of length {T}, block size is {self.config.block_size_max}"
 
         # forward the token and the positional embedding
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
-        pos_emb = self.transformer.wpe(pos) # positional embeddings of shape (T, n_embd)
+        # pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
+        # pos_emb = self.transformer.wpe(pos) # positional embeddings of shape (T, n_embd)
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
-        x = tok_emb + pos_emb # shape (B, T, n_embd)  --  broadcasting
+        # x = tok_emb + pos_emb # shape (B, T, n_embd)  --  broadcasting
+        x = tok_emb # shape (B, T, n_embd)
 
         # forward the blocks of transformer
         for block in self.transformer.h:
@@ -158,73 +194,73 @@ class GPT(nn.Module):
         return logits, loss
     
 
-    def crop_block_size(self, block_size):
-        # model changes to decrease the block size if needed
-        # this will not be needed if we use RoPE, but for positional embeddings 
-        assert block_size < self.config.block_size
-        self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+    # def crop_block_size(self, block_size):
+    #     # model changes to decrease the block size if needed
+    #     # this will not be needed if we use RoPE, but for positional embeddings 
+    #     assert block_size < self.config.block_size
+    #     self.config.block_size = block_size
+    #     self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
 
-        for block in self.transformer.h:
-            if hasattr(block.attn, 'bias'):
-                block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]
+    #     for block in self.transformer.h:
+    #         if hasattr(block.attn, 'bias'):
+    #             block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]
 
-    @classmethod  
-    def from_pretrained(cls, model_type):
-        """Loads pretrained GPT-2 model weights from huggingface - it is a constructor"""
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        from transformers import GPT2LMHeadModel
-        print("loading weights from pretrained gpt: %s" % model_type)
+    # @classmethod  
+    # def from_pretrained(cls, model_type):
+    #     """Loads pretrained GPT-2 model weights from huggingface - it is a constructor"""
+    #     assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+    #     from transformers import GPT2LMHeadModel
+    #     print("loading weights from pretrained gpt: %s" % model_type)
 
-        # n_layer, n_head and n_embd are determined from model_type
-        config_args = {
-            'gpt2': dict(n_layer=12, n_head=12, n_embd=768), #124M params
-            'gpt2-medium': dict(n_layer=24, n_head=16, n_embd=1024), #350M params
-            'gpt2-large': dict(n_layer=36, n_head=20, n_embd=1280), #774M params
-            'gpt2-xl': dict(n_layer=48, n_head=25, n_embd=1600), #1558M params
-        }[model_type]
-        config_args['vocab_size'] = 50257 
-        config_args['block_size'] = 1024
-        # create a from scratch initialized miniGPT model
-        config = GPTConfig(**config_args)
-        model = GPT(config)
-        sd = model.state_dict()
-        sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]
+    #     # n_layer, n_head and n_embd are determined from model_type
+    #     config_args = {
+    #         'gpt2': dict(n_layer=12, n_head=12, n_embd=768), #124M params
+    #         'gpt2-medium': dict(n_layer=24, n_head=16, n_embd=1024), #350M params
+    #         'gpt2-large': dict(n_layer=36, n_head=20, n_embd=1280), #774M params
+    #         'gpt2-xl': dict(n_layer=48, n_head=25, n_embd=1600), #1558M params
+    #     }[model_type]
+    #     config_args['vocab_size'] = 50257 
+    #     config_args['block_size'] = 1024
+    #     # create a from scratch initialized miniGPT model
+    #     config = GPTConfig(**config_args)
+    #     model = GPT(config)
+    #     sd = model.state_dict()
+    #     sd_keys = sd.keys()
+    #     sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]
 
-        # init a huggingface/transformers model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
+    #     # init a huggingface/transformers model
+    #     model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+    #     sd_hf = model_hf.state_dict()
 
-        # copy while ensuring all of the parameters are aligned and match in name and shapes
-        sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+    #     # copy while ensuring all of the parameters are aligned and match in name and shapes
+    #     sd_keys_hf = sd_hf.keys()
+    #     sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]
+    #     sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]
+    #     transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
 
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys {len(sd_keys_hf)} != {len(sd_keys)}"
+    #     assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys {len(sd_keys_hf)} != {len(sd_keys)}"
 
-        for k in sd_keys_hf:
-            if any(k.endswith(t) for t in transposed): # if the key is in transposed
-                # because the gpt-2 hf uses Conv1d and not nn.Linear, so the weights are in reversed order
-                assert sd_hf[k].shape[::-1] == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())  # take the transpose of the hf weights and then copy
+    #     for k in sd_keys_hf:
+    #         if any(k.endswith(t) for t in transposed): # if the key is in transposed
+    #             # because the gpt-2 hf uses Conv1d and not nn.Linear, so the weights are in reversed order
+    #             assert sd_hf[k].shape[::-1] == sd[k].shape
+    #             with torch.no_grad():
+    #                 sd[k].copy_(sd_hf[k].t())  # take the transpose of the hf weights and then copy
 
-            else:
-                # vanilla copy
-                assert sd_hf[k].shape == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
+    #         else:
+    #             # vanilla copy
+    #             assert sd_hf[k].shape == sd[k].shape
+    #             with torch.no_grad():
+    #                 sd[k].copy_(sd_hf[k])
 
-        return model
+    #     return model
     
-    def estimate_mfu(self, fwdbwd_per_iter, dt):
+    def estimate_mfu(self, fwdbwd_per_iter, block_size, dt):
         """ estimate model flops utilization (MFU) in units of GPU (A100) bfloat16 peak FLOPS """
         # estimate the number of flops per iteration per gpu
         # see PaLM paper Appendix B of https://arxiv.org/pdf/2204.02311
         N = self.get_num_params()
-        L, H, Q, T = self.config.n_layer, self.config.n_head, self.config.n_embd//self.config.n_head, self.config.block_size
+        L, H, Q, T = self.config.n_layer, self.config.n_head, self.config.n_embd//self.config.n_head, block_size
         flops_per_token = 6*N + 12*L*H*Q*T
         flops_per_fwdbwd = flops_per_token * T  # fwdbwd stands for forward backward
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter  # single gpu

@@ -31,16 +31,28 @@ class DataLoaderLite:
         # state, init at shard zero
         self.current_shard = current_shard if current_shard is not None else 0  # if loading from checkpoint
         self.tokens = load_tokens(shards[self.current_shard])
-        # state
-        self.current_position = current_pos if current_pos is not None else self.B * self.T * self.process_rank
+     
+        if T is not None:
+            # state
+            self.current_position = current_pos if current_pos is not None else self.B * self.T * self.process_rank
+        else:
+            self.current_position = None
 
-    def reset(self):
+    def reset(self, split='train'):
         self.current_shard = 0
         self.tokens = load_tokens(self.shards[self.current_shard])
-        self.current_position = self.B * self.T * self.process_rank
+        if split != 'val':
+            self.current_position = self.B * self.T * self.process_rank
+        else:
+            self.current_position = None
 
-    def next_batch(self):
-        B, T = self.B, self.T
+    def next_batch(self, B=None, T=None):
+        B, T = self.B if B is None else B, self.T if T is None else T
+
+        if self.current_position is None:
+            # initialize the position if not set already
+            self.current_position = B * T * self.process_rank
+
         buf = self.tokens[self.current_position : self.current_position+B*T+1]
         x = buf[:-1].view(B, T) # inputs
         y = buf[1:].view(B, T) # targets
