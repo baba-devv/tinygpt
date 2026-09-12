@@ -264,6 +264,11 @@ for step in range(start_step, max_steps):
     for mini_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
+
+        if ddp:
+            # the synchronization is not required after every mini step and is needed only at last
+            model.require_backward_grad_sync = (mini_step == grad_accum_steps - 1)
+
         with torch.autocast(device_type=device, dtype=torch.bfloat16):  # do the forward pass in a lower precision
             # forward pass  # calculate logits and loss
             logits, loss = model(x, y)
@@ -272,9 +277,6 @@ for step in range(start_step, max_steps):
         loss_accum += loss.detach()
 
         # backward pass == calculate grads
-        if ddp:
-            # the synchronization is not required after every mini step and is needed only at last
-            model.require_backward_grad_sync = (mini_step == grad_accum_steps - 1)
         loss.backward()
 
     if ddp:
