@@ -39,7 +39,7 @@ learning_rate = 6e-4
 weight_decay = 0.1 # 10%
 
 val_step = 100 # validation loss every 100th step
-val_loss_steps = 20
+val_loss_steps = 30
 val_block_sizes = [512, 1024, 2048, 4096]
 
 assert all([((B*T_train) % block_size == 0) for block_size in val_block_sizes]), f'{val_block_sizes} are not compatible with train - batch_size {B} and seq length {T_train}' 
@@ -176,36 +176,50 @@ val_loader = DataLoaderLite(B=B, T=None, process_rank=ddp_rank, num_processes=dd
 
 
 def val_loss(step, block_size=T_train):
+    # validation also calculates the common sequence loss for different block_size's 
 
-    global uncompiled_model, val_step, val_loader, device, val_loss_steps, ddp, master_process, T_train, B
+    global uncompiled_model, val_step, val_loader, device, val_loss_steps, ddp, master_process, T_train, B, val_block_sizes
 
     uncompiled_model.eval() # validation should not force recompile the model on each T update
     val_loader.reset(split="val") # call reset once every block_size so that common data is evaluated
 
-    batch_size = (B * T_train) // block_size
+    batch_size = (B * T_train) // max(val_block_sizes)
+    common_len = min(val_block_sizes)
 
     with torch.no_grad():
-        val_loss_accum = 0.0
+        val_loss_accum, val_loss_accum_common = 0.0, 0.0
 
         for _ in range(val_loss_steps):
             # check the loss on validation set
-            x, y = val_loader.next_batch(B=batch_size, T=block_size)
+            x_full, y_full = val_loader.next_batch(B=batch_size, T=max(val_block_sizes))
+            x, y = x_full[:, :block_size], y_full[:, :block_size]  # this is done for repetition of data in each step independent of block_size
             x, y = x.to(device), y.to(device)
             with torch.autocast(device_type=device, dtype=torch.bfloat16):  # do the forward pass in a lower precision
                 # forward pass  # calculate logits and loss
-                logits, loss = uncompiled_model(x, y)   #@TODO: this loss is fine but a reduction=False also is needed so that
-                                                        # we can derive the common 512 token loss over all the seq. lengths 
+                logits, loss = uncompiled_model(x, y) 
+
+                # logits and y both are present, we can recalculate CE w/o reduction
+                loss_per_tok = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1, reduction='none').view(logits.size(0), -1)  # (B, T)
+                loss_per_tok_common = loss_per_tok[:, :common_len].mean() # take the loss of common tokens across block_sizes
+            
             loss = loss / val_loss_steps
+            loss_per_tok_common = loss_per_tok_common / val_loss_steps 
+
             val_loss_accum += loss.detach()
+            val_loss_accum_common += loss_per_tok_common.detach() 
+
     if ddp:
         dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        dist.all_reduce(val_loss_accum_common, op=dist.ReduceOp.AVG) 
+
     if master_process:
         val_loss_accum = val_loss_accum.item()
+        val_loss_accum_common = val_loss_accum_common.item()
         print(f"\n")
-        print(f"step: {step}, block_size: {block_size}, validation loss: {val_loss_accum:.4f}")
+        print(f"step: {step}, block_size: {block_size}, validation loss: {val_loss_accum:.4f}, common validation loss: {val_loss_accum_common:.4f}")
         print("\n")
 
-    return val_loss_accum
+    return (val_loss_accum, val_loss_accum_common)
 
 
 # ---------------------------------------------------------------------------------------

@@ -120,7 +120,7 @@ class GPTConfig:
     n_layer: int = 12 # number of layers
     n_head: int = 12 # number of heads
     n_embd: int = 768  # embedding dimension
-    block_size_max: int = int(1e4) # max block size supported
+    block_size_max: int = int(5e3) # max block size supported
 
 
 class GPT(nn.Module):
